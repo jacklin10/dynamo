@@ -1,13 +1,137 @@
 Dynamo
 ======
 
-Introduction goes here.
-
+Dynamo allows you to dynamically add attributes to an ActiveRecord model.  
 
 Example
 =======
 
-Example goes here.
+Dynamo is a useful tool when there is the possibility you will need to change or add
+attributes for a particular model.  This comes in handy when you have different customers
+with different needs.
+
+For example you might have a Contact model that normally has fields like:
+first_name, last_name, and phone_number.  
+
+This works fine for some of your customers, but now you have a customer who is asking to 
+track age, and address too.
+
+With dynamo you can just add those fields on the fly:
+Contact.add_dynamo_field('age',:Number)
+Contact.add_dynamo_field('address', :Text)
+
+Now Contacts have these fields, and you didn't have to change your schema or do a migration.
+
+Our application has a database per customer model so we are able to separate everything so
+customer A's contacts have fields ('a', 'b', 'c')
+customer B's contacts have fields ('x', 'y', 'z')
+
+Otherwise we would have to have different models per customer, or cram all possible 
+attributes in the model causing all customers to be overloaded with fields they don't care about.
+
+If you want to then delete this dynamo attribute you can do:
+Contact.remove_dynamo_field('age')
+
+This will remove the field and all of its values!
+
+Installation
+============
+
+./script/plugin install git@github.com:jacklin10/dynamo.git
+
+Dynamo requires two tables so to generate a migration for those tables do:
+./script/generate dynamo migration
+
+Run the migration:
+rake db:migrate
+
+Details
+=======
+
+Dynamo works by creating two new tables.
+dynamo_fields and dynamo_field_values
+
+When you add a dynamo field it will save to dynamo_fields, and when you assign a value to the field
+it will save in dynamo_field_values.
+
+It was designed to read and write dynamo attributes the same way as normal static attributes so:
+c = Contact.first
+c.my_dynamo_field = 'xxx'
+c.my_dynamo_field # xxx
+
+works just as it would with a standard attribute.  
+
+Contact.attributes will spill out the dynamo attributes and c.respond_to? :my_dynamo_field will return true.
+
+Views:
+
+Dynamo attributes will not automatically appear on your view pages however.  Not yet anyway.
+I created a couple helpers you can use though ( see lib/dynamo_helper.rb)
+
+Here's an example of the simple helper:
+   <%= @supplier.dynamo_fields_p(f) %>
+
+This will output all the dynamic field labels and a text field for its input encased
+in <p> tags.
+
+And here is a less pretty version that will blend in with any markup you are using:
+<table width="50%">
+	<%  @supplier.dynamo_fields do |field_name| %>
+       <tr>
+       	<td><%= field_name %>:</td>
+			<td><%= f.text_field field_name %></td>
+		</tr>
+   <%  end %>
+	<tr>
+		<td>
+			<%= f.submit %>
+		</td>
+	</tr>
+</table>
+
+Some other things I created within the application ( not inside dynamo) that might help you out:
+
+If you want to display all the non dynamo attributes on the screen:
+
+def dump_non_dynamo_attributes(model)
+  # We don't want to display these because they aren't normally displayed/manipulated attributes.
+  hide_these=['updated_at','creator_id','updater_id']
+  returning [] do |show_these|
+    # Need an instance so we have access to the instance methods
+    dynamo_model_instance = model.new
+    dynamo_model_instance.attributes.keys.each do |attr|
+      if !dynamo_model_instance.is_dynamo_field?(attr) && !hide_these.include?(attr)
+        show_these << attr        
+      end
+    end
+  end
+end
+
+If you want to dump all the dynamo attributes:
+def dump_dynamo_attributes(model)
+  attrs=[]
+  model.dynamo_fields.each do |attr|
+    attrs << attr 
+  end
+  attrs
+end
+
+If you want to know which models in your application are using dynamo attributes you can do this:
+ActiveRecord::Base.send(:subclasses).each do |model|
+  @dynamo_models << model.name if model.instance_methods.include?('is_dynamo_field?')
+end
+
+Future
+======
+
+Right now the field types you can create are limited to Text, Number, and Decimal.
+We would like to expand this to checkbox, select on, select many, etc.
+
+We would also like the dynamo attributes to blend in more seamlessly with the view side of things so
+you don't need to use any helpers just the normal rails helpers.
+
+Performance needs improved a little also.  Need to make some more use of caching. 
+
 
 
 Copyright (c) 2010 [name of plugin creator], released under the MIT license
