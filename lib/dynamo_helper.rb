@@ -11,7 +11,6 @@ module DynamoHelper
   #  This will yield something like:
   #  <table><tr><td>my dynamo attribute</td><td><input type='text' name='my_dynamo_model[my dynamo attribute]' size='15' value='hello'></td></tr></table>
   def dynamo_fields_p(form_helper, text_field_size=30)
-    puts "Wtf: #{self.class.dynamo_fields.inspect}"
     html=[]
     self.class.dynamo_fields.each do |dynamo_field|
       html << '<p>'

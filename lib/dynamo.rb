@@ -1,6 +1,6 @@
 module Dynamo
   
-  include DynamoHelper 
+  include DynamoHelper
   
   # map types to those contained in the db. Avoids any name collisions using names like string and float.
   VALID_FIELD_TYPES = {:Text => 'val_string', :Number=>'val_int', :Decimal=>'val_float'}
@@ -22,20 +22,22 @@ module Dynamo
         # http://weblog.rubyonrails.org/2006/4/26/new-in-rails-module-alias_method_chain
         # Basically the 'normal' method_missing is now called :method_missing_without_dynamo
         # and the dynamo overridden version is called :method_missing_with_dynamo
-        # Now when we have an attribute that is part of the object in a normal rails way we just use the 
+        # Now when we have an attribute that is part of the object in a normal rails way we just use the
         # 'without' method, but for dynamic attributes we need to do some extra stuff so we use the 'with' method.
+        attr_accessor :dynamo_cache
         
         # Make sure the methods haven't been built already
         unless method_defined? :method_missing_without_dynamo
           # We don't save the dynamo_field_value until after the model is saved. This is because we need the db id and that doesn't exist
           # until after you save to the db.
           after_save :delay_save
-          alias_method_chain :method_missing,  :dynamo   
+          after_destroy :cleanup_after_destroy
+          alias_method_chain :method_missing,  :dynamo
           private
           alias_method_chain :read_attribute,  :dynamo
           alias_method_chain :write_attribute, :dynamo
         end
-      end    
+      end
       
     end
     
@@ -47,7 +49,7 @@ module Dynamo
     # examples:
     #  Supplier.add_dynamo_field(:zzzz)
     #  Supplier.add_dynamo_field('my_field', :string)
-    def add_dynamo_field(field_name, field_type=:string)      
+    def add_dynamo_field(field_name, field_type=:string)
       field_name = field_name.to_s
       field_type = field_type.to_s
       logger.debug "Dynamo: add_dynamo field  Name: #{field_name} FieldType: #{field_type} "
@@ -60,8 +62,6 @@ module Dynamo
       
       # Create and save this new dynamic field.
       DynamoField.new(:model=>self.to_s, :field_name=>field_name, :field_type=>VALID_FIELD_TYPES[field_type.to_sym]).save!
-      
-      clear_cache
     end
     
     # Remove the given field from the DynamoField model.
@@ -73,26 +73,15 @@ module Dynamo
     def remove_dynamo_field(field_name)
       field_name = field_name.to_s
       logger.debug "Dynamo: remove_dynamo field  Name: #{field_name}"
-      # NOTE: Delete doesn't fire callbacks like before_destroy, after_destroy, but its faster.  
+      # NOTE: Delete doesn't fire callbacks like before_destroy, after_destroy, but its faster.
       logger.warn "Attempted to delete non-existing field: #{self.to_s}:#{field_name}" if DynamoField.delete_all(:field_name=>field_name) == 0
-
-      clear_cache
     end
     
-    # Returns array of all field names ( not DynamoField objects) for this model.
+    # List all the dynamo fields available to this class.
     # example:
     #  Supplier.dynamo_fields
     def dynamo_fields
-      # Can't really cache this because if you have multi db's per customer and you connect to 
-      # a different customer then it will have the fields for the previous object instead.
       DynamoField.find(:all, :conditions=>['model = ?', self.to_s]).map(&:field_name)
-    end
-    
-    # Deletes the dynamo_fields cache key so the next time you need to read the fields
-    # they will be retrieved from the db.
-    # Use when you add / remove a new dynamo field
-    def clear_cache
-      Rails.cache.delete('dynamo_fields')
     end
     
   end # ClassMethods
@@ -100,25 +89,27 @@ module Dynamo
   module InstanceMethods
     
     # Instance level cache of the dynamo fields for this model.
-    # When you output a dynamo field or value it several calls to is_dynamo_field.
-    # Now that the fields are cached it saves all those db queries.
     def cached_dynamo_fields
-      return Rails.cache.read("dynamo_fields") unless Rails.cache.read("dynamo_fields").nil?
-      Rails.cache.write("dynamo_fields", DynamoField.find(:all, :conditions=>['model = ?', self.class.to_s]).map(&:field_name))
-      Rails.cache.read("dynamo_fields")
+      return self.dynamo_cache unless self.dynamo_cache.nil?
+      self.dynamo_cache = DynamoField.find(:all, :conditions=>['model = ?', self.class.to_s])
     end
     
     # Returns true if the given field name is a dynamic field for this model
     # example:
     #  Supplier.is_dynamo_field?(:some_field)
     def is_dynamo_field?(field_name)
-      cached_dynamo_fields.include? field_name
+      # If result of this find is not nil it means the field does exist so return true because it is a dynamo field
+       (cached_dynamo_fields.detect{|dynamo_field| dynamo_field.field_name == field_name}.nil?) ? false : true
+    end
+    
+    def cached_dynamo_field_by_name(field_name)
+      cached_dynamo_fields.detect{|df| df.field_name == field_name}
     end
     
     private
     
     # Override of the rails method_missing method
-    # When you attempt to access a dynamo field there are no methods available so 
+    # When you attempt to access a dynamo field there are no methods available so
     # we will end up in here.  If the desired field is found to be a dynamo field then
     # we will read or write that attribute using overrides of the rails read_attribute / write_attribute methods.
     # params:
@@ -145,57 +136,103 @@ module Dynamo
         # Looks like its a method rails nor dynamo understands. Error time!
         raise e
       end
-      
     end
     
     # Override of the rails read_attribute method
-    # If we detect a dynamo field we do a read from the dynamo tables, if not then we call the rails version of the method. 
+    # If we detect a dynamo field we do a read from the dynamo tables, if not then we call the rails version of the method.
     def read_attribute_with_dynamo(field_name)
       field_name = field_name.to_s
       if is_dynamo_field?(field_name)
-        # Finds the DynamoField for the given field and then returns the value for it.
-        df = DynamoField.find_by_field_name(field_name)
-        # The only tricky part is that it looks at the type for the DynamoField to determine which column
-        # in DynamoFieldValues to read from.  ( .send(df.field_type )
-        # Note that it returns an array of values.  This is for when you have a multi select ( not implemented yet )
-        vals = (df.dynamo_field_values.empty?) ? '' : df.dynamo_field_values.detect{|i| !i.send(df.field_type).nil? && i.model_id == self.id }
         
-        if vals.blank?
-          return nil
-        end
+        # If the model's id is nil then we know there aren't going to be any values to read.
+        # example: If this is a supplier model and we are creating a new supplier at this point its id is nil
+        #          Because of this fact we know there are no dynamo_field_values associated with it so return.
+        #  If we didn't return here then when checking for values we would create extra queries.
+        #  Any time we do a df.dynamo_field_values we create overhead so we only want to do that when we have to.
+        return if self.id == nil
         
-        return vals.send(df.field_type)
+        # We're doing a real read now so get the dynamo_field from the cache then query to get the correct value.
+        dynamo_field = cached_dynamo_field_by_name(field_name)
+        dynamo_field_value = dynamo_field.dynamo_field_values.detect{|dyn_field_val| dyn_field_val.dynamo_field_id == dynamo_field.id && dyn_field_val.model_id == self.id }
+        return nil if dynamo_field_value.blank?
+        return dynamo_field_value.send(dynamo_field.field_type)
       end
-      # If its a 'normal' attribute let rails handle it in its usual way      
+      # If its a 'normal' attribute let rails handle it in its usual way
       read_attribute_without_dynamo(field_name)
     end
     
     # Override of the rails write_attribute method
-    # If we detect a dynamo field we do a read from the dynamo tables, if not then we call the rails version of the method. 
+    # If we detect a dynamo field we do a read from the dynamo tables, if not then we call the rails version of the method.
     def write_attribute_with_dynamo(field_name, value)
       if is_dynamo_field?(field_name)
         # Store these guys for now.  We don't actually save the field value until the model is saved ( i.e my_supplier.save ).
         # If we were to save the field_value now we wouldn't be able to know the id of the model to link this value to it.
         # @see delay_save
         @all_fields_and_values ||= []
-        @dynamo_field = DynamoField.find_by_field_name(field_name)
-        @all_fields_and_values << {:field => @dynamo_field.id, :field_type => @dynamo_field.field_type, :val=>value}
-        @dynamo_field_value = value
+        @all_fields_and_values << {:dynamo_field=>cached_dynamo_field_by_name(field_name), :value=>value}
       end
       # If its a 'normal' attribute let rails write it in the usual way.
       write_attribute_without_dynamo(field_name, value)
     end
     
+    # Ensure the dynamo_field_values that are associated with this model
+    # are removed after the model itself has been deleted
+    def cleanup_after_destroy
+      ActiveRecord::Base.connection.execute("DELETE FROM dynamo_field_values WHERE model_id = #{self.id}")
+    end
+    
     # We need the id of this model to link it to the value.  That id doesn't exist until
     # after it has been saved.  We use the after save callback to update the field_value to make the link.
     def delay_save
-      # The all_fields_and_values array is populated in the write_attribute_with_dynamo method above.
+      
+      # If no dynamo attributes exist then the array will be nil
+      return if @all_fields_and_values.nil?
+      
+      # If there is a dynamo_field_value for one of this model's fields then there will be for all.  Query for it here
+      # and you'll only do it once, but move it into the loop and you'll count for each dynamo_field.
+      first = @all_fields_and_values[0]
+      @count = DynamoFieldValue.count(:conditions=>"model_id = #{self.id} AND dynamo_field_id=#{first[:dynamo_field].id}")
+      
+      all_values = []
       @all_fields_and_values.each do |fv|
-        dfv = DynamoFieldValue.find(:first, :conditions =>["model_id = ? AND dynamo_field_id = ?", self.id, fv[:field]]) || DynamoFieldValue.new(:dynamo_field_id => fv[:field])
-        dfv.send("#{fv[:field_type]}=", fv[:val])
-        dfv.model_id = self.id
-        dfv.save!
-      end unless @all_fields_and_values.nil? # If no dynamo attributes exist then the array will be nil
+        # If count is 0 it means that no dynamo_field_values exist for this model so its brand new.
+        if @count == 0
+          dfv = DynamoFieldValue.new
+          dfv.dynamo_field_id = fv[:dynamo_field].id
+          dfv.send("#{fv[:dynamo_field].field_type}=", fv[:value])
+          dfv.created_at, dfv.updated_at = Time.now, Time.now
+          dfv.model_id = self.id
+        else
+          # This is an existing set of values so we need to update.
+          # Update is slower because we need to get the dynamo_field_values for this field so its extra queries
+          dfv = fv[:dynamo_field].dynamo_field_values
+          dfv = dfv.detect {|dyn_field_value| dyn_field_value.model_id == self.id}
+          dfv.send("#{fv[:dynamo_field].field_type}=", fv[:value])
+          dfv.save!
+          next
+        end
+        
+        # Snag all the fields that we want in the insert. We don't include the id
+        @insert_fields = dfv.attribute_names.reject{ |field| field == 'id'} if @insert_fields.blank?
+        
+        values = []
+        # Loop through all the fields and build the values block
+        @insert_fields.each do |field_name|
+          # We need to tinker with fields based on their type for sql syntax purposes
+          temp_val = dfv.send(field_name)
+          temp_val = "'#{temp_val}'" if temp_val.class.to_s == "String" || temp_val.class.to_s == "ActiveSupport::TimeWithZone"
+          temp_val = "NULL" if temp_val.nil?
+          values << temp_val
+        end
+        
+        all_values << "(#{values.join(',')})"
+      end
+      
+      return if all_values.empty?
+      
+      # improving performance by doing bulk inserts. The more dynamic fields the model has the more benefit this has over single inserts.
+      bulk_insert_stmt = "INSERT INTO `dynamo_field_values`(#{@insert_fields.join(',')}) VALUES #{all_values.join(',').gsub(/"NULL"/, 'NULL')}"
+      ActiveRecord::Base.connection.execute(bulk_insert_stmt)
       
     end
     
@@ -205,7 +242,6 @@ module Dynamo
       return if new_attributes.nil?
       attributes = new_attributes.dup
       attributes.stringify_keys!
-      
       multi_parameter_attributes = []
       attributes = remove_attributes_protected_from_mass_assignment(attributes) if guard_protected_attributes
       
@@ -215,7 +251,7 @@ module Dynamo
         else
           # This will fail if we are adding dynamic attributes. In dynamo we'll let the method_missing pick
           # up when the attribute doesn't exist and we'll handle it from there.
-          # respond_to?(:"#{k}=") ? send(:"#{k}=", v) : raise(UnknownAttributeError, "unknown attribute: #{k}")            
+          # respond_to?(:"#{k}=") ? send(:"#{k}=", v) : raise(UnknownAttributeError, "unknown attribute: #{k}")
           send(:"#{k}=", v)
         end
       end
