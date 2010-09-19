@@ -18,6 +18,14 @@ module Dynamo
       
       # Create access/mutator for this new field
       self.class_eval do
+        
+        # Override rails method to add the dynamo columns for the class.
+        def self.column_names
+          @column_names ||= columns.map { |column| column.name }
+          # Add the dynamo column names to the list.
+          @column_names + self.dynamo_fields
+        end
+        
         # alias_method_chain:
         # http://weblog.rubyonrails.org/2006/4/26/new-in-rails-module-alias_method_chain
         # Basically the 'normal' method_missing is now called :method_missing_without_dynamo
@@ -25,6 +33,7 @@ module Dynamo
         # Now when we have an attribute that is part of the object in a normal rails way we just use the
         # 'without' method, but for dynamic attributes we need to do some extra stuff so we use the 'with' method.
         attr_accessor :dynamo_cache
+        attr_accessor :dynamo_field_value_cache
         
         # Make sure the methods haven't been built already
         unless method_defined? :method_missing_without_dynamo
@@ -94,6 +103,14 @@ module Dynamo
       self.dynamo_cache = DynamoField.find(:all, :conditions=>['model = ?', self.class.to_s])
     end
     
+    # Stores a cache of the field values for this model.
+    def cached_dynamo_field_values
+      # We only want to load the field_values available for this model 1 time otherwise it'll query
+      # for each value read from the dynamo model. This was really slowing things down like exporting a model
+      # to xls or something where you are reading 100's of dynamo model's and values all at one time.
+      self.dynamo_field_value_cache ||= DynamoFieldValue.find_all_by_model_id(self.id)
+    end
+    
     # Returns true if the given field name is a dynamic field for this model
     # example:
     #  Supplier.is_dynamo_field?(:some_field)
@@ -102,6 +119,7 @@ module Dynamo
        (cached_dynamo_fields.detect{|dynamo_field| dynamo_field.field_name == field_name}.nil?) ? false : true
     end
     
+    # Helper method to get a dynamo_field object from the cache by its field_name
     def cached_dynamo_field_by_name(field_name)
       cached_dynamo_fields.detect{|df| df.field_name == field_name}
     end
@@ -153,7 +171,10 @@ module Dynamo
         
         # We're doing a real read now so get the dynamo_field from the cache then query to get the correct value.
         dynamo_field = cached_dynamo_field_by_name(field_name)
-        dynamo_field_value = dynamo_field.dynamo_field_values.detect{|dyn_field_val| dyn_field_val.dynamo_field_id == dynamo_field.id && dyn_field_val.model_id == self.id }
+        
+        # Get all the dynamo field values for this model from the cache.
+        dynamo_field_value = cached_dynamo_field_values.detect{|dyn_field_val| dyn_field_val.dynamo_field_id == dynamo_field.id && dyn_field_val.model_id == self.id }
+        
         return nil if dynamo_field_value.blank?
         return dynamo_field_value.send(dynamo_field.field_type)
       end
@@ -181,59 +202,66 @@ module Dynamo
       ActiveRecord::Base.connection.execute("DELETE FROM dynamo_field_values WHERE model_id = #{self.id}")
     end
     
+    # Builds one section of a bulk insert statment. 
+    # Returns a string like: ('val1', 'val2', 3)
+    # So its meant to be plugged in to a block insert statment.
+    def build_insert_stmt(dynamo_field_value)
+      values = []
+      insert_stmt_fields = DynamoFieldValue.column_names.reject{ |field| field == 'id'}
+      insert_stmt_fields.each do |field_name|
+        # We need to tinker with fields based on their type for sql syntax purposes
+        temp_val = dynamo_field_value.send(field_name)
+        temp_val = "'#{temp_val}'" if temp_val.class.to_s == "String" || temp_val.class.to_s == "ActiveSupport::TimeWithZone"
+        temp_val = "NULL" if temp_val.nil?
+        values << temp_val
+      end
+      "(#{values.join(',')})"
+    end
+    
     # We need the id of this model to link it to the value.  That id doesn't exist until
     # after it has been saved.  We use the after save callback to update the field_value to make the link.
     def delay_save
       
-      # If no dynamo attributes exist then the array will be nil
       return if @all_fields_and_values.nil?
       
       # If there is a dynamo_field_value for one of this model's fields then there will be for all.  Query for it here
       # and you'll only do it once, but move it into the loop and you'll count for each dynamo_field.
       first = @all_fields_and_values[0]
-      @count = DynamoFieldValue.count(:conditions=>"model_id = #{self.id} AND dynamo_field_id=#{first[:dynamo_field].id}")
+      count = DynamoFieldValue.count(:conditions=>"model_id = #{self.id} AND dynamo_field_id=#{first[:dynamo_field].id}")
       
       all_values = []
       @all_fields_and_values.each do |fv|
         # If count is 0 it means that no dynamo_field_values exist for this model so its brand new.
-        if @count == 0
-          dfv = DynamoFieldValue.new
-          dfv.dynamo_field_id = fv[:dynamo_field].id
-          dfv.send("#{fv[:dynamo_field].field_type}=", fv[:value])
-          dfv.created_at, dfv.updated_at = Time.now, Time.now
-          dfv.model_id = self.id
+        if count == 0
+            dfv = DynamoFieldValue.new(:dynamo_field_id=>fv[:dynamo_field].id, :model_id=>self.id, :created_at=>Time.now, :updated_at=>Time.now, "#{fv[:dynamo_field].field_type}".to_sym => fv[:value])
+          all_values << build_insert_stmt(dfv)
         else
           # This is an existing set of values so we need to update.
           # Update is slower because we need to get the dynamo_field_values for this field so its extra queries
           dfv = fv[:dynamo_field].dynamo_field_values
-          dfv = dfv.detect {|dyn_field_value| dyn_field_value.model_id == self.id}
-          dfv.send("#{fv[:dynamo_field].field_type}=", fv[:value])
-          dfv.save!
-          next
+          if dfv.blank?
+            dfv = DynamoFieldValue.new(:dynamo_field_id=>fv[:dynamo_field].id, :model_id=>self.id, :created_at=>Time.now, :updated_at=>Time.now, "#{fv[:dynamo_field].field_type}".to_sym => fv[:value])
+            all_values << build_insert_stmt(dfv)
+            # If you don't clear the cache a second save on this instance won't see the newly created dynamo_field_value and it will insert it again.
+            self.dynamo_cache=nil
+          else
+            # Find the dynamo_field_value we want to update.
+            dfv = dfv.detect{|dyn_field_value| dyn_field_value.model_id == self.id}
+            dfv.send("#{fv[:dynamo_field].field_type}=", fv[:value])
+            dfv.save!
+          end
         end
         
-        # Snag all the fields that we want in the insert. We don't include the id
-        @insert_fields = dfv.attribute_names.reject{ |field| field == 'id'} if @insert_fields.blank?
-        
-        values = []
-        # Loop through all the fields and build the values block
-        @insert_fields.each do |field_name|
-          # We need to tinker with fields based on their type for sql syntax purposes
-          temp_val = dfv.send(field_name)
-          temp_val = "'#{temp_val}'" if temp_val.class.to_s == "String" || temp_val.class.to_s == "ActiveSupport::TimeWithZone"
-          temp_val = "NULL" if temp_val.nil?
-          values << temp_val
-        end
-        
-        all_values << "(#{values.join(',')})"
+        # Reset this now that we have processed all the insert / updates needed.  If you don't 
+        # a double call to save could produce unexpected results.
+        @all_fields_and_values = nil
       end
       
       return if all_values.empty?
       
       # improving performance by doing bulk inserts. The more dynamic fields the model has the more benefit this has over single inserts.
-      bulk_insert_stmt = "INSERT INTO `dynamo_field_values`(#{@insert_fields.join(',')}) VALUES #{all_values.join(',').gsub(/"NULL"/, 'NULL')}"
+      bulk_insert_stmt = "INSERT INTO `dynamo_field_values`(#{DynamoFieldValue.column_names.reject{ |field| field == 'id'}.join(',')}) VALUES #{all_values.join(',').gsub(/"NULL"/, 'NULL')}"
       ActiveRecord::Base.connection.execute(bulk_insert_stmt)
-      
     end
     
     # This is overridden from ActiveRecord and the only change is commenting out the respond_to
